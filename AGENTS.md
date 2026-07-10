@@ -1,4 +1,4 @@
-# invoice-pipeline — AI 维护指南
+# invoice-pipeline— AI 维护指南
 
 本文件是 AI agent 维护本 skill 时的契约。改任何脚本前先读这里。
 
@@ -10,35 +10,50 @@ skill 是端到端流水线，5 步可独立重跑：
 |------|------|------|------|
 | 1. scan | `scripts/Scan-Source.ps1` | `SourceDir` | `out\scan-<ts>.json`（待处理清单） |
 | 2. ocr  | `scripts/Ocr-Bailian.ps1`   | `out\scan-*.json` 或 `SourceDir` | `SourceDir\mapping-<ts>.json` |
-| 3. rename | `scripts\Rename-ByPayer.ps1` | `SourceDir\mapping-*.json` | 原位重命名 |
-| 4. archive | `scripts\Archive-ByPayer.ps1` | `SourceDir\*.pdf` | `<ArchiveRoot>\<payer>\` |
+| 3. rename | `scripts/Rename-ByPayer.ps1` | `SourceDir\mapping-*.json` | 原位重命名 |
+| 4. archive | `scripts/Archive-ByPayer.ps1` | `SourceDir\*.pdf` | `<ArchiveRoot>\<payer>\` |
 | 5. upload  | `upload/Upload-Gongyi.js`  | `SourceDir\*.pdf` + `upload\uploaded-state.json` | 公益平台已上传 |
 
 入口：
+
 - `scripts/Invoke-Pipeline.ps1` 调 1→2→3→4，跳过 5
 - `scripts/Invoke-Upload.ps1` 单独调 5
 
 ## 关键约定
 
-### 1. OCR 缓存优先
+### 1. OCR 缓存优先 + amount 强制
 
-`SourceDir\mapping_*.json` 一旦存在，**Step 2 默认复用**。要强制重跑传 `-ForceReOcr`。这是为了避免对同一批 PDF 重复烧百炼 API。
+`SourceDir\mapping-*.json` 一旦存在，**Step 2 默认复用**。要强制重跑传 `-ForceReOcr`。
 
-JSON 格式（`mapping_*.json`）：
+JSON 格式（`mapping-*.json`）：
+
 ```json
 [
   {
     "pdf": "E:\\阿里发票\\阿里257张\\110501260003695195.pdf",
     "payer": "杭州薄山勇捷服装经营部",
-    "method": "bl-multimodal-understand",
-    "model": "qwen-vl-max",
-    "elapsed_ms": 0,
+    "amount": "50.90",
+    "invoiceDate": "2026-06-25",
+    "method": "bl-vision-describe+regex",
+    "model": "qwen3-vl-plus",
+    "elapsedMs": 8882,
     "error": ""
   }
 ]
 ```
+**字段语义**：
 
-**重要：所有 JSON 读写必须用 UTF-8**（`[System.IO.File]::ReadAllText(..., [System.Text.UTF8Encoding]::new($false))`），不要用 `Get-Content` / `Set-Content`，否则 PowerShell 默认按 GBK 解码 UTF-8 无 BOM 文件会出乱码。
+- `payer` — 交款人公司名（按抬头匹配的核心字段）
+- `amount` — 金额合计（小写），用于 2+ 条“待开具”时的金额消歧；缺则按 1-to-1 严格匹配处理
+- `invoiceDate` — 开票日期（YYYY-MM-DD），暂未参与匹配，但保留备查
+- `method` / `model` — 留痕，便于审计
+
+**缓存策略**：
+
+- 若最新 mapping 含 `amount` 字段 → 直接复用，不调 bl
+- 若最新 mapping 不含 `amount`（旧版本产物）→ 自动强制重 OCR 以填充 `amount`，**这会烧百炼 API**
+
+**重要：所有 JSON 读写必须用 UTF-8**（`[System.IO.File]::ReadAllText(..., [System.Text.UTF8Encoding]::new(\$false))`），不要用 `Get-Content` / `Set-Content`，否则 PowerShell 默认按 GBK 解码 UTF-8 无 BOM 文件会出乱码。
 
 ### 2. 上传状态优先
 
@@ -49,17 +64,17 @@ JSON 格式（`mapping_*.json`）：
 每个 step 都可以独立反复跑，不产生副作用：
 
 - `scan` — 纯读
-- `ocr` — 已有 mapping 就跳过
+- `ocr` — 已有 mapping（含 amount）就跳过
 - `rename` — 目标已存在且 SHA256 相同则跳过；不同则进 `out\failed\rename-conflict-*.log`
 - `archive` — 目标已存在且 SHA256 相同则跳过
 - `upload` — uploaded-state.json 中 hash 一致则跳过
 
 ### 4. 错误处理边界
 
-**只对"自己能权威解释的错误"做语义化处理**。bl 服务端错误原样透传，不二次包装。
+**只对“自己能权威解释的错误”做语义化处理**。bl 服务端错误原样透传，不二次包装。
 
 | 错误来源 | 归类 | 处理 |
-|---------|------|------|
+|------|------|------|
 | 缺参、SourceDir 不存在 | 内部 | throw + 退出码 2 |
 | mapping JSON 解析失败 | 内部 | 终止整批，要求修复 JSON |
 | 单个 PDF 识别 bl 返回无 payer | 内部 | 进 `out\failed\ocr-fail-*.log`，继续下一张 |
@@ -85,31 +100,38 @@ JSON 格式（`mapping_*.json`）：
 
 `upload/` 目录要求 Node >= 20。Playwright 1.61+ 兼容 Node 24。
 
+### 9. 隐私边界
+
+OCR 只提取 `payer` / `amount` / `invoiceDate`。**禁止**额外抽取或上传：
+
+- 统一社会信用代码（creditCode）
+- 销售方 / 收款单位（seller）
+- 项目编码 / 项目名称 / 商品明细（items）
+- 复核人 / 收款人
+- 票据号码、校验码、备注
+
+prompt (`prompts/extract-payer.md`) 是**纯转写**指令（“把所有可见的文字内容逐行完整转写出来”），让模型原样输出，**由 `Ocr-Parse.js` 用正则抽取**需要的字段，**避免模型自己格式化 JSON 时塞入额外字段**。
+### 10. 外部依赖
+
+- **poppler / pdftoppm**：必须能调通 `pdftoppm -r 200 -png -f 1 -l 1`；Windows 推荐 `winget install poppler`；脚本里硬编码了兜底路径 `C:\\Users\\hbusl\\AppData\\Local\\Microsoft\\WinGet\\Packages\\oschwartz10612.Poppler_Microsoft.Winget.Source_8wekyb3d8bbwe\\poppler-25.07.0\\Library\\bin\\pdftoppm.exe`
+- **bailian bl CLI**：`npm i -g bailian-cli`，先 `bl auth login`；文档 https://help.aliyun.com/zh/model-studio/developer-reference/install-bailian-cli
+- **Playwright**：仅 `upload/` 目录需要；`npm install playwright && npx playwright install chromium`
+
 ## 扩展指南
 
 ### 加新 OCR 后端
 
 1. 在 `scripts/` 下新建 `Ocr-<Engine>.ps1`，签名一致：`-SourceDir <path> -OutputJson <path>`
 2. `Invoke-Pipeline.ps1` 加 `-OcrEngine {Bailian|Paddle}` 参数分支
-3. 输出 JSON 格式必须兼容（见约定 1）
+3. 输出 JSON 必须含 `payer` / `amount` / `invoiceDate`（与约定 1 一致）
 
 ### Step 5 upload 选择器配置
 
-`upload/Upload-Gongyi.js` 顶部有 5 个 `TODO_SELECTOR_*` 常量，需要在真实页面上确认后填入：
+`upload/Upload-Gongyi.js` 顶部的选择器已在真实公益平台上验证通过（见 SKILL.md“平台关键 selector”）。若平台改版：
 
-| 常量 | 含义 | 怎么找 |
-|------|------|--------|
-| `TODO_SELECTOR_LOGIN_INDICATOR` | 登录后才有的元素 | F12 登录前后对比 |
-| `TODO_SELECTOR_UPLOAD_BUTTON` | 触发上传的入口按钮 | 右键 → Copy selector |
-| `TODO_SELECTOR_FILE_INPUT` | `<input type="file">` | 通常隐藏 |
-| `TODO_SELECTOR_SUBMIT_BUTTON` | 上传后"提交"按钮（如有） | 如果上传即提交，留 null |
-| `TODO_SELECTOR_SUCCESS_INDICATOR` | 上传成功标志 | "上传成功" 文本 / 列表多了一行 |
-
-填好后用 dry-run 跑一次：
-```powershell
-.\scripts\Invoke-Upload.ps1 -SourceDir "E:\ALI-INV\sample" -DryRun
-```
-然后 `-Limit 1` 试一张真实上传。
+- 用 `Start-Chrome-CDP.ps1` 起独立 Chrome
+- 手动登录 + 走到票据管理页
+- F12 改 selector，重新跑 `Invoke-Upload.ps1 -DryRun -Limit 1`
 
 ### 实现其它上传平台
 
@@ -119,23 +141,23 @@ JSON 格式（`mapping_*.json`）：
 
 ```powershell
 # 1. 干跑 scan
-.\scripts\Scan-Source.ps1 -SourceDir "E:\阿里发票\阿里257张"
+.\\scripts\\Scan-Source.ps1 -SourceDir "E:\\阿里发票\\阿里257张"
 
-# 2. 强制 OCR（已有 mapping 也会重跑）
-.\scripts\Ocr-Bailian.ps1 -SourceDir "E:\阿里发票\阿里257张" -ForceReOcr
+# 2. 强制 OCR（已有 mapping 也会重跑；旧 mapping 缺 amount 也会自动重跑）
+.\\scripts\\Ocr-Bailian.ps1 -SourceDir "E:\\阿里发票\\阿里257张" -ForceReOcr
 
 # 3. 跑 rename（用现有 mapping）
-.\scripts\Rename-ByPayer.ps1 -SourceDir "E:\阿里发票\阿里257张"
+.\\scripts\\Rename-ByPayer.ps1 -SourceDir "E:\\阿里发票\\阿里257张"
 
 # 4. 全流程
-.\scripts\Invoke-Pipeline.ps1 -SourceDir "E:\阿里发票\阿里257张"
+.\\scripts\\Invoke-Pipeline.ps1 -SourceDir "E:\\阿里发票\\阿里257张"
 
 # 5. 上传
-.\scripts\Start-Chrome-CDP.ps1
-.\scripts\Invoke-Upload.ps1 -SourceDir "E:\阿里发票\阿里257张" -DryRun
-.\scripts\Invoke-Upload.ps1 -SourceDir "E:\阿里发票\阿里257张" -Limit 1
+.\\scripts\\Start-Chrome-CDP.ps1
+.\\scripts\\Invoke-Upload.ps1 -SourceDir "E:\\阿里发票\\阿里257张" -DryRun
+.\\scripts\\Invoke-Upload.ps1 -SourceDir "E:\\阿里发票\\阿里257张" -Limit 1
 ```
 
 ## 这份指南怎么演化
 
-跟 `modelstudioai/cli/AGENTS.md` 一样，**随真实工作沉淀**。发现新场景/新坑 → 补到对应 step 的"扩展指南"下。
+跟 `modelstudioai/cli/AGENTS.md` 一样，**随真实工作沉淀**。发现新场景/新坑 → 补到对应 step 的“扩展指南”下。

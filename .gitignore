@@ -5,9 +5,13 @@ out/
 
 # 测试残留
 test-*.ps1
+test-*.js
 debug-*.ps1
+debug-*.js
 run-*.ps1
+run-*.js
 prep-*.ps1
+prep-*.js
 
 # Node
 upload/node_modules/

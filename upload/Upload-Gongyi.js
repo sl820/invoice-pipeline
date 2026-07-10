@@ -3,16 +3,14 @@
  * Upload-Gongyi.js
  * 阿里公益平台发票上传（Step 5 of invoice-pipeline）
  *
- * 流程：对 SourceDir 下每个 {交款人}.pdf
- *   1. 推断 payer（从文件名 {票号}_{公司} 或 {公司}）
- *   2. 平台搜索: 填开票抬头={payer} + 查询
- *   3. 筛选 "待开具" 状态
- *   4. 匹配规则：
- *        0 条待开具   -> 跳过（已开具或不在平台）
- *        1 条待开具   -> 真匹配，自动上传
- *        N>=2 条待开具 -> 跳过，进 failed（让用户人工）
- *   5. 点"立即开票" → 弹框 → setInputFiles → 点确 定（--yes 时）
- *   6. 记录到 uploaded-state.json
+ * 匹配规则（v2，含 amount 消歧）：
+ *   1. 平台搜索"开票抬头"= payer
+ *   2. 筛"待开具"状态
+ *   3. 1 条        -> 自动上传
+ *   4. 多条 + amount 不空 -> 按 amount 筛；筛后 1 条 -> 上传；筛后 0/N -> skip
+ *   5. 多条 + amount 空   -> skip（让用户人工）
+ *
+ * payer / amount 来源：优先 mapping-{ts}.json，否则从 PDF 文件名 + 运行前 bl OCR
  *
  * 用法：
  *   node Upload-Gongyi.js --source-dir "E:\阿里发票\阿里257张" [--dry-run] [--limit 5] [--yes]
@@ -22,18 +20,15 @@ const fs = require("fs");
 const path = require("path");
 const { chromium } = require("playwright");
 
-// ---------- 配置 ----------
 const PLATFORM_URL = "https://open.alibabafoundation.com/open/workbench/employee/org/donation/invoice/manage";
 const CDP_URL = "http://127.0.0.1:9222";
 const STATE_FILE = path.join(__dirname, "uploaded-state.json");
 const FAILED_DIR = path.join(__dirname, "..", "out", "failed");
 const REPORT_DIR = path.join(__dirname, "..", "out", "reports");
-
 const RETRY_MAX = 2;
 const RETRY_BACKOFF_MS = [2000, 5000];
-const TARGET_STATE = "待开具"; // 只处理这个状态
+const TARGET_STATE = "待开具";
 
-// ---------- CLI 解析 ----------
 function parseArgs() {
   const args = { sourceDir: null, dryRun: false, limit: Infinity, yes: false };
   const argv = process.argv.slice(2);
@@ -52,194 +47,179 @@ function parseArgs() {
   return args;
 }
 
-// ---------- payer 推断 ----------
 function inferPayer(basename) {
   const idx = basename.indexOf("_");
   if (idx > 0) {
     const prefix = basename.substring(0, idx);
-    if (/^\d{10,}$/.test(prefix)) {
-      return basename.substring(idx + 1).replace(/\.pdf$/i, "");
-    }
+    if (/^\d{10,}$/.test(prefix)) return basename.substring(idx + 1).replace(/\.pdf$/i, "");
   }
   return basename.replace(/\.pdf$/i, "");
 }
 
-// ---------- 状态 ----------
-function loadState() {
-  if (!fs.existsSync(STATE_FILE)) return {};
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); }
-  catch { return {}; }
-}
-function saveState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
-}
-function fileHash(p) {
-  const stat = fs.statSync(p);
-  return `${stat.size}-${Math.floor(stat.mtimeMs)}`;
-}
+function loadState() { if (!fs.existsSync(STATE_FILE)) return {}; try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); } catch { return {}; } }
+function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2), "utf8"); }
+function fileHash(p) { const st = fs.statSync(p); return `${st.size}-${Math.floor(st.mtimeMs)}`; }
 function ensureDir(d) { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); }
 function logFailure(basename, reason, detail) {
   ensureDir(FAILED_DIR);
-  const file = path.join(FAILED_DIR, `upload-${basename}.log`);
-  const content = [
-    new Date().toISOString(),
-    `reason: ${reason}`,
-    detail || "",
-  ].join("\n");
-  fs.writeFileSync(file, content + "\n", "utf8");
+  fs.writeFileSync(path.join(FAILED_DIR, `upload-${basename}.log`),
+    `${new Date().toISOString()}\nreason: ${reason}\n${detail || ""}\n`, "utf8");
 }
 
-// ---------- 单条处理 ----------
-async function processOne(page, pdfPath, opts) {
-  const basename = path.basename(pdfPath);
-  const payer = inferPayer(basename);
-  if (!payer) throw new Error("payer-empty: 文件名无法推断抬头");
+// 读 mapping-*.json 最新一份，构建 basename -> {payer, amount} 索引
+function loadMapping(sourceDir) {
+  const files = fs.readdirSync(sourceDir).filter(n => /^mapping-.*\.json$/.test(n));
+  if (files.length === 0) return null;
+  const latest = files.sort().pop();
+  const raw = fs.readFileSync(path.join(sourceDir, latest), "utf8");
+  try { return JSON.parse(raw); } catch { return null; }
+}
 
-  // 1. 重置 + 搜索
-  const resetBtn = page.locator("button:has-text('重 置')");
-  if (await resetBtn.count() > 0) {
-    await resetBtn.click();
-    await page.waitForTimeout(500);
+function lookupInMapping(records, pdfPath) {
+  if (!records) return null;
+  const base = path.basename(pdfPath, ".pdf");
+  // mapping 里的 pdf 字段是绝对路径，basename 可能不同（rename 后），
+  // 兜底：取 pdf 的 basename 不含扩展名，再跟原 mapping 比
+  // 简化：按文件大小+mtime 匹配
+  const st = fs.statSync(pdfPath);
+  for (const r of records) {
+    if (!r.pdf) continue;
+    try {
+      const rPath = r.pdf;
+      if (fs.existsSync(rPath)) {
+        const rst = fs.statSync(rPath);
+        if (rst.size === st.size && Math.abs(rst.mtimeMs - st.mtimeMs) < 1000) {
+          return { payer: r.payer || "", amount: r.amount || "" };
+        }
+      }
+    } catch {}
+    // 兜底：如果 r.pdf 的 basename 是纯票号 (110501260003695195)，那跟我们的 {票号}_{公司} 匹配
+    const rBase = path.basename(r.pdf || "", ".pdf");
+    if (rBase === base.split("_")[0]) {
+      return { payer: r.payer || "", amount: r.amount || "" };
+    }
   }
+  return null;
+}
+
+async function processOne(page, pdfPath, opts, payerHint, amountHint) {
+  const basename = path.basename(pdfPath);
+  // 1. 推断 payer
+  const payer = payerHint || inferPayer(basename);
+  if (!payer) throw new Error("payer-empty");
+
+  // 2. 平台搜索
+  const resetBtn = page.locator("button:has-text('重 置')");
+  if (await resetBtn.count() > 0) { await resetBtn.click(); await page.waitForTimeout(500); }
   await page.locator("input#control-hooks_invoiceTitle").fill(payer);
   await page.locator("button:has-text('查 询')").click();
   await page.waitForTimeout(2500);
 
-  // 2. 抓所有行 + 状态
+  // 3. 抓所有行 + 状态 + 金额
   const allRows = page.locator("table tbody tr.ant-table-row");
   const allCount = await allRows.count();
+  if (allCount === 0) throw new Error(`match-not-found: 平台无抬头="${payer}"的记录`);
 
-  if (allCount === 0) {
-    throw new Error(`match-not-found: 平台无抬头="${payer}"的记录`);
-  }
-
-  // 3. 只筛"待开具"
   const rowData = await allRows.evaluateAll((els) =>
     els.map((r, i) => {
       const cells = Array.from(r.querySelectorAll("td"));
-      // 状态在第 10 列（从 0 计），第 8 列是金额
       const get = (n) => cells[n] ? cells[n].innerText.trim() : "";
       return {
-        rowIdx: i,
-        seq: get(1),
-        applicationId: get(2),
-        payer: get(3),
-        creditCode: get(4),
-        months: get(5),
-        invoiceType: get(6),
-        amount: get(7),
-        state: get(9),
-        shop: get(10),
+        rowIdx: i, seq: get(1), applicationId: get(2), payer: get(3),
+        creditCode: get(4), months: get(5), invoiceType: get(6),
+        amount: get(7), state: get(9), shop: get(10),
       };
     })
   );
-
-  const pending = rowData.filter((r) => r.state === TARGET_STATE);
+  const pending = rowData.filter(r => r.state === TARGET_STATE);
 
   if (pending.length === 0) {
-    const stateList = rowData.map((r) => `${r.state}(${r.amount}元 ${r.months} ${r.shop})`).join("; ");
-    throw new Error(
-      `no-pending: 平台找到 ${allCount} 条记录，但全部不是"${TARGET_STATE}"状态。` +
-      `现有状态: ${stateList}`
-    );
+    const stateList = rowData.map(r => `${r.state}(${r.amount}元 ${r.shop})`).join("; ");
+    throw new Error(`no-pending: 平台找到 ${allCount} 条记录但无"${TARGET_STATE}"。现有: ${stateList}`);
   }
 
-  if (pending.length > 1) {
-    const lines = pending.map((r) =>
-      `  [${r.seq}] ${r.months} 金额=${r.amount} 店铺=${r.shop} 申请ID=${r.applicationId}`
-    ).join("\n");
-    throw new Error(
-      `match-multiple: "${payer}"有 ${pending.length} 条"${TARGET_STATE}"申请，无法自动选择。\n` +
-      `请人工确认哪一条对应本 PDF (${basename})，或修改 PDF 文件名包含店铺信息。\n候选:\n${lines}`
-    );
+  // 4. 消歧：多条 + 有 amount -> 按 amount 筛
+  let target;
+  if (pending.length === 1) {
+    target = pending[0];
+  } else if (amountHint) {
+    // 规范化金额比较（去前导零等）
+    const norm = (s) => s.replace(/[¥￥,\s]/g, "").replace(/^0+/, "").trim();
+    const want = norm(amountHint);
+    const matched = pending.filter(r => norm(r.amount) === want);
+    if (matched.length === 1) {
+      console.log(`  [ambig] ${pending.length} 条待开具，amount="${amountHint}" 唯一匹配 1 条`);
+      target = matched[0];
+    } else if (matched.length === 0) {
+      const lines = pending.map(r => `  [${r.seq}] 金额=${r.amount} 店铺=${r.shop} 月份=${r.months}`).join("\n");
+      throw new Error(`amount-no-match: ${pending.length} 条待开具但无一条 amount="${amountHint}" 对得上。\n候选:\n${lines}`);
+    } else {
+      const lines = matched.map(r => `  [${r.seq}] 金额=${r.amount} 店铺=${r.shop}`).join("\n");
+      throw new Error(`amount-multiple: amount="${amountHint}" 匹配 ${matched.length} 条，仍需人工。\n候选:\n${lines}`);
+    }
+  } else {
+    const lines = pending.map(r => `  [${r.seq}] 金额=${r.amount} 店铺=${r.shop} 月份=${r.months}`).join("\n");
+    throw new Error(`match-multiple: "${payer}"有 ${pending.length} 条待开具，且无 amount 信息可消歧。\n候选:\n${lines}\n建议: 跑 Step 2 (Ocr-Bailian) 抽取 amount 后重试。`);
   }
 
-  const target = pending[0];
   console.log(`  [match] seq=${target.seq} 申请ID=${target.applicationId} 金额=${target.amount} 店铺=${target.shop}`);
 
-  // 4. 点立即开票
-  const acceptBtn = allRows.nth(target.rowIdx).locator("button:has(span:text-is('立即开票'))");
-  await acceptBtn.click();
+  // 5. 点立即开票
+  await allRows.nth(target.rowIdx).locator("button:has(span:text-is('立即开票'))").click();
   await page.waitForTimeout(2000);
 
-  // 5. 等弹框
   const modal = page.locator(".ant-modal");
-  if (await modal.count() === 0) {
-    throw new Error("modal-not-shown: 点击立即开票后弹框未出现");
-  }
-
-  const modalInfo = await modal.first().evaluate((m) =>
-    m.innerText.replace(/\s+/g, " ").slice(0, 200)
-  );
+  if (await modal.count() === 0) throw new Error("modal-not-shown");
+  const modalInfo = await modal.first().evaluate(m => m.innerText.replace(/\s+/g, " ").slice(0, 200));
 
   // 6. 上传
-  const fileInput = modal.locator("input[type=file]");
-  await fileInput.setInputFiles(pdfPath);
+  await modal.locator("input[type=file]").setInputFiles(pdfPath);
   await page.waitForTimeout(2000);
-
   const uploadedItem = modal.locator(".ant-upload-list-item");
-  if (await uploadedItem.count() === 0) {
-    throw new Error("upload-failed: .ant-upload-list-item 未出现");
-  }
+  if (await uploadedItem.count() === 0) throw new Error("upload-failed: .ant-upload-list-item 未出现");
   const uploadedName = (await uploadedItem.first().innerText()).trim();
 
-  // 7. 决定是否点确 定
+  // 7. 决定提交
   if (!opts.yes) {
     console.log(`  [dry-run] 弹框已就绪，PDF=${basename}`);
     const cancelBtn = modal.locator(".ant-btn:has-text('取 消')");
-    if (await cancelBtn.count() > 0) {
-      await cancelBtn.click();
-      await page.waitForTimeout(1000);
-    }
+    if (await cancelBtn.count() > 0) { await cancelBtn.click(); await page.waitForTimeout(1000); }
     return { dryRun: true, uploadedName, target };
   }
-
-  // 真提交
-  const confirmBtn = modal.locator(".ant-btn-primary:has-text('确 定')");
-  await confirmBtn.click();
+  await modal.locator(".ant-btn-primary:has-text('确 定')").click();
   await page.waitForSelector(".ant-modal", { state: "detached", timeout: 15000 });
   await page.waitForTimeout(1500);
   return { submitted: true, uploadedName, target };
 }
 
-// ---------- 主流程 ----------
 async function main() {
   const args = parseArgs();
   const sourceDir = args.sourceDir;
-  if (!fs.existsSync(sourceDir)) {
-    console.error(`ERROR: source dir not found: ${sourceDir}`);
-    process.exit(2);
-  }
+  if (!fs.existsSync(sourceDir)) { console.error(`ERROR: source dir not found: ${sourceDir}`); process.exit(2); }
 
-  const allPdfs = fs
-    .readdirSync(sourceDir)
-    .filter((n) => n.toLowerCase().endsWith(".pdf"))
-    .map((n) => path.join(sourceDir, n));
-
+  const allPdfs = fs.readdirSync(sourceDir).filter(n => n.toLowerCase().endsWith(".pdf")).map(n => path.join(sourceDir, n));
   const state = loadState();
-  const todo = allPdfs.filter((p) => {
+  const todo = allPdfs.filter(p => {
     const h = fileHash(p);
     return !state[path.basename(p)] || state[path.basename(p)].hash !== h;
   });
 
+  // 加载 mapping 索引
+  const mapping = loadMapping(sourceDir);
+  const mappingHasAmount = mapping && mapping.length > 0 && mapping[0].amount !== undefined;
   console.log(`[scan] total=${allPdfs.length} todo=${todo.length} already_uploaded=${allPdfs.length - todo.length}`);
-  console.log(`[mode] ${args.yes ? "--yes: 真点确 定提交" : "dry-run: 走完到 setInputFiles 后取消"}`);
+  console.log(`[mapping] ${mapping ? (mappingHasAmount ? "有 amount 字段" : "无 amount 字段") : "无 mapping"}`);
+  console.log(`[mode] ${args.yes ? "--yes: 真点确 定" : "dry-run: 走完到 setInputFiles 后取消"}`);
 
   if (todo.length === 0) { console.log("[done] 没有待上传文件"); return; }
 
   console.log(`[cdp] connecting to ${CDP_URL} ...`);
   let browser;
-  try {
-    browser = await chromium.connectOverCDP(CDP_URL);
-  } catch (e) {
-    console.error(`ERROR: 无法连接 Chrome CDP: ${e.message}`);
-    console.error("请先运行 scripts/Start-Chrome-CDP.ps1");
-    process.exit(1);
-  }
+  try { browser = await chromium.connectOverCDP(CDP_URL); }
+  catch (e) { console.error(`ERROR: CDP 无法连接: ${e.message}`); console.error("请先运行 scripts/Start-Chrome-CDP.ps1"); process.exit(1); }
 
   const ctx = browser.contexts()[0];
   const page = ctx.pages()[0];
-
   console.log(`[nav] -> ${PLATFORM_URL}`);
   await page.goto(PLATFORM_URL, { waitUntil: "networkidle", timeout: 30000 });
   await page.waitForTimeout(1500);
@@ -249,20 +229,16 @@ async function main() {
   for (let i = 0; i < limit; i++) {
     const pdf = todo[i];
     const basename = path.basename(pdf);
-    console.log(`[${i + 1}/${limit}] ${basename}  payer="${inferPayer(basename)}"`);
+    const fromMapping = lookupInMapping(mapping, pdf);
+    const payerHint = fromMapping?.payer || "";
+    const amountHint = fromMapping?.amount || "";
+    console.log(`[${i + 1}/${limit}] ${basename}  payer="${payerHint || inferPayer(basename)}" amount="${amountHint}"`);
 
-    let didProcess = false;
     for (let attempt = 1; attempt <= RETRY_MAX; attempt++) {
       try {
-        const result = await processOne(page, pdf, args);
+        const result = await processOne(page, pdf, args, payerHint, amountHint);
         if (result.submitted) {
-          state[basename] = {
-            hash: fileHash(pdf),
-            uploadedAt: new Date().toISOString(),
-            uploadedName: result.uploadedName,
-            target: result.target,
-            size: fs.statSync(pdf).size,
-          };
+          state[basename] = { hash: fileHash(pdf), uploadedAt: new Date().toISOString(), uploadedName: result.uploadedName, target: result.target, size: fs.statSync(pdf).size };
           saveState(state);
           console.log(`  [ok] submitted`);
           ok++;
@@ -270,15 +246,12 @@ async function main() {
           console.log(`  [ok] dry-run passed`);
           ok++;
         }
-        didProcess = true;
         break;
       } catch (err) {
         if (attempt >= RETRY_MAX) {
           const firstLine = err.message.split("\n")[0];
-          if (firstLine.startsWith("match-not-found") ||
-              firstLine.startsWith("no-pending") ||
-              firstLine.startsWith("match-multiple")) {
-            // 这三类是"无匹配"而不是错误，记 skipped
+          if (firstLine.startsWith("match-not-found") || firstLine.startsWith("no-pending") ||
+              firstLine.startsWith("match-multiple") || firstLine.startsWith("amount-")) {
             console.log(`  [skip] ${firstLine.split(":")[0]}`);
             logFailure(basename, firstLine, err.message);
             skipped++;
@@ -290,27 +263,24 @@ async function main() {
         } else {
           const backoff = RETRY_BACKOFF_MS[attempt - 1];
           console.error(`  [retry ${attempt}/${RETRY_MAX}] ${err.message.split("\n")[0]} (wait ${backoff}ms)`);
-          await new Promise((r) => setTimeout(r, backoff));
+          await new Promise(r => setTimeout(r, backoff));
         }
       }
-    }
-    if (!didProcess && !skipped && !fail) {
-      // should not reach
     }
   }
 
   ensureDir(REPORT_DIR);
   const reportFile = path.join(REPORT_DIR, `upload-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`);
-  const report = [
+  fs.writeFileSync(reportFile, [
     `mode=${args.yes ? "submit" : "dry-run"}`,
     `source=${sourceDir}`,
+    `mappingHasAmount=${mappingHasAmount}`,
     `total=${allPdfs.length}`,
     `todo=${todo.length}`,
     `ok=${ok}`,
     `skipped=${skipped}`,
     `failed=${fail}`,
-  ].join("\n");
-  fs.writeFileSync(reportFile, report + "\n", "utf8");
+  ].join("\n") + "\n", "utf8");
 
   console.log("");
   console.log(`[done] ok=${ok} skipped=${skipped} failed=${fail}`);
@@ -319,4 +289,4 @@ async function main() {
   await browser.close().catch(() => {});
 }
 
-main().catch((e) => { console.error("FATAL:", e); process.exit(1); });
+main().catch(e => { console.error("FATAL:", e); process.exit(1); });
