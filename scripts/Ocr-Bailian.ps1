@@ -108,16 +108,20 @@ foreach ($pdf in $pdfFiles) {
         $ocrTxt = Join-Path $ocrCacheDir ($pdf.BaseName + "-ocr.txt")
         [System.IO.File]::WriteAllText($ocrTxt, $blOut, [System.Text.UTF8Encoding]::new($false))
 
-        # 5d. 用 Node 解析器抽 payer + amount
+        # 5d. 用 Node 解析器抽 payer + amount + invoiceDate（payer 优先文件名）
         $parsed = & node $parserScript $ocrTxt 2>&1 | Out-String
         try {
             $parsedObj = $parsed | ConvertFrom-Json
-            if ($parsedObj.payer) { $record.payer = [string]$parsedObj.payer }
+            # payer 优先取文件名（ground truth），OCR 抽到的存 ocrPayer 备查
+            $filenameCompany = $pdf.BaseName.Substring($pdf.BaseName.IndexOf('_') + 1)
+            $record.payer = $filenameCompany
+            if ($parsedObj.payer) { $record.ocrPayer = [string]$parsedObj.payer }
             if ($parsedObj.amount) { $record.amount = [string]$parsedObj.amount }
             if ($parsedObj.invoiceDate) { $record.invoiceDate = [string]$parsedObj.invoiceDate }
         } catch {
             throw "解析器返回非 JSON: $parsed"
         }
+
 
         if (-not $record.payer) {
             $record.error = "解析后 payer 为空"

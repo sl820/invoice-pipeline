@@ -2,7 +2,7 @@
 
 > 阿里公益平台发票自动化流水线 · Codex Skill
 
-把零散、未规范命名的电子发票 PDF，自动变成按"交款人"公司名重命名、按抬头归档、**按抬头匹配**后批量上传到阿里公益平台。OCR 走阿里云百炼 `bl` 多模态识别（`bl vision describe` + `qwen3-vl-plus`），Node 端正则抽取三个字段：payer / amount / invoiceDate。
+把零散、未规范命名的电子发票 PDF，自动变成按"交款人"公司名重命名、按抬头归档、**按抬头匹配**后批量上传到阿里公益平台。OCR 走阿里云百炼 `bl` 多模态识别（`bl vision describe` + `qwen3-vl-plus`），文件已按 {票号}_{公司}.pdf 重命名后，payer 直接取文件名（避免 OCR 错字），amount / invoiceDate 由 Node 正则从 OCR 转写文本抽取。
 
 ## 为什么做这个
 
@@ -16,7 +16,7 @@ scan  ->  ocr  ->  rename  ->  archive  ->  upload
 ```
 
 - **scan** 扫描待处理 PDF
-- **ocr** pdftoppm 把首页转 PNG → bl vision describe 转写 → Node 正则解析三字段，落到 `mapping-*.json`
+- **ocr** pdftoppm 把首页转 PNG → bl vision describe 转写 → Node 正则解析 amount/invoiceDate 两字段（payer 直接取文件名），落到 `mapping-*.json`
 - **rename** 改为 {交款人}.pdf，同公司多张自动加 (2) (3) 后缀
 - **archive** 按抬头归档到子目录（可选）
 - **upload** Playwright + CDP 复用已登录 Chrome，平台搜开票抬头 = payer → 筛待开具 → 1-to-1 匹配（2+ 条时用 amount 消歧） → 上传 PDF
@@ -29,8 +29,6 @@ scan  ->  ocr  ->  rename  ->  archive  ->  upload
 - **缓存优先**：识别结果落到 mapping-*.json，上传记录到 uploaded-state.json，下次直接复用
 - **参数化**：SourceDir 可指定任意目录
 - **5 步解耦**：可以只跑某一步
-
-Apache-2.0
 
 ## 快速开始
 
@@ -75,7 +73,7 @@ Apache-2.0
 
 ## 工程规范
 
-项目按 modelstudioai/cli 的 AGENTS.md 约定组织：
+项目按 `modelstudioai/cli` 的 `AGENTS.md` 约定组织：
 
 - 5 步分层 + 错误处理边界 + 禁止单字母变量
 - 所有可重跑步骤幂等
