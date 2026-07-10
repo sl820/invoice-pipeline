@@ -1,0 +1,31 @@
+# invoice-pipeline 配置文件
+
+## 默认路径
+
+```yaml
+source_dir: E:\阿里发票\阿里257张
+archive_root: null  # 不归档则保留原位
+bl_model: qwen-vl-max
+mapping_reuse: true  # 优先复用 mapping-*.json
+```
+
+## 抬头清洗规则
+
+- Windows 非法字符 `\ / : * ? " < > |` 替换为 `_`
+- 保留：中文、英文、空格、括号、`&`、`.`、`-`
+
+## 冲突处理
+
+同 payer 已有文件：
+- SHA256 相同 → 跳过（幂等）
+- SHA256 不同 → 加 `(2)`, `(3)` ... 后缀
+
+## bl 调用
+
+```bash
+bl multimodal understand \
+  --file "E:\阿里发票\xxx.pdf" \
+  --prompt "$(cat prompts/extract-payer.md)" \
+  --model qwen-vl-max \
+  --output json
+```
