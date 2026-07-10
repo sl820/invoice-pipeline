@@ -1,0 +1,17 @@
+{
+  "name": "invoice-pipeline-upload",
+  "version": "0.1.0",
+  "description": "Upload renamed e-invoice PDFs to Alibaba Foundation (open.alibabafoundation.com) via Playwright + CDP.",
+  "main": "Upload-Gongyi.js",
+  "scripts": {
+    "start": "node Upload-Gongyi.js"
+  },
+  "author": "hbusl",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "^1.61.1"
+  }
+}

@@ -19,17 +19,19 @@ scan  ->  ocr  ->  rename  ->  archive  ->  upload
 - **ocr** 调百炼 `bl` 提取"交款人"（优先复用本地 mapping 缓存，零 API 成本）
 - **rename** 改为 `{交款人}.pdf`，同公司多张自动加 `(2) (3)` 后缀
 - **archive** 按抬头归档到子目录（可选）
-- **upload** 自动化上传到阿里公益平台（CDP / Playwright）
+- **upload** Playwright + CDP 接管已登录 Chrome，批量上传到公益平台
 
 ## 设计原则
 
 - **幂等**：每一步可以反复跑，目标已存在且内容相同时自动跳过
 - **失败隔离**：单张失败不影响整批，失败项进 `out/failed/` 留待人工
-- **缓存优先**：识别结果落到 `mapping_*.json`，下次直接复用
+- **缓存优先**：识别结果落到 `mapping_*.json`，上传记录到 `uploaded-state.json`，下次直接复用
 - **参数化**：`SourceDir` 可指定任意目录，257 张也好、5 张也好
-- **5 步解耦**：可以只跑 scan 做检查，可以只跑 rename 用已有 mapping
+- **5 步解耦**：可以只跑 scan 做检查，可以只跑 rename 用已有 mapping，可以只跑 upload
 
 ## 快速开始
+
+### 处理 + 重命名（Step 1-4）
 
 ```powershell
 # 1. 装 bl CLI（百炼）
@@ -40,7 +42,25 @@ bl auth login --api-key sk-xxxxx
 .\scripts\Invoke-Pipeline.ps1 -SourceDir "E:\阿里发票\阿里257张"
 ```
 
-更细的用法（干跑 / 强制重 OCR / 指定归档根目录）见 [`SKILL.md`](./SKILL.md)。
+### 上传到公益平台（Step 5）
+
+```powershell
+# 1. 启动带 CDP 的 Chrome（独立 profile，不影响你日常 Chrome）
+.\scripts\Start-Chrome-CDP.ps1
+
+# 2. 弹出窗口里手动登录 https://open.alibabafoundation.com/index，然后关掉窗口
+#    (cookie 落盘到 C:\codex\chrome-gongyi，下次自动恢复登录)
+
+# 3. 填 upload/Upload-Gongyi.js 顶部的 TODO_SELECTOR_* 标记（基于真实页面 DOM）
+
+# 4. 先 dry-run 看会传哪些
+.\scripts\Invoke-Upload.ps1 -SourceDir "E:\阿里发票\阿里257张" -DryRun
+
+# 5. 真传
+.\scripts\Invoke-Upload.ps1 -SourceDir "E:\阿里发票\阿里257张"
+```
+
+更细的用法（干跑 / 强制重 OCR / 指定归档根目录 / 限制张数）见 [`SKILL.md`](./SKILL.md)。
 
 ## 工程规范
 
@@ -55,19 +75,27 @@ bl auth login --api-key sk-xxxxx
 
 ```
 invoice-pipeline/
-+- SKILL.md          # Codex agent 主入口
-+- AGENTS.md         # 维护契约（AI / 开发者共用）
++- SKILL.md                 # Codex agent 主入口
++- AGENTS.md                # 维护契约（AI / 开发者共用）
 +- README.md
++- LICENSE
 +- config/
 |  +- config.yaml
 +- prompts/
 |  +- extract-payer.md
-+- scripts/
-   +- Scan-Source.ps1
-   +- Ocr-Bailian.ps1
-   +- Rename-ByPayer.ps1
-   +- Archive-ByPayer.ps1
-   +- Invoke-Pipeline.ps1
++- scripts/                 # PowerShell 入口
+|  +- Scan-Source.ps1
+|  +- Ocr-Bailian.ps1
+|  +- Rename-ByPayer.ps1
+|  +- Archive-ByPayer.ps1
+|  +- Invoke-Pipeline.ps1
+|  +- Start-Chrome-CDP.ps1  # 启动带 CDP 的 Chrome
+|  +- Invoke-Upload.ps1     # Step 5 入口
++- upload/                  # Node + Playwright
+|  +- package.json
+|  +- Upload-Gongyi.js      # 主上传脚本
+|  +- uploaded-state.json   # 上传幂等记录（自动生成）
+|  +- node_modules/
 ```
 
 ## 状态
@@ -78,7 +106,7 @@ invoice-pipeline/
 | 2. ocr  | [x] 已实现 | 复用 mapping / 调 bl |
 | 3. rename | [x] 已实现 | 已用 6 张样本端到端验证（SHA256 一致） |
 | 4. archive | [x] 已实现 | 默认跳过 |
-| 5. upload | [ ] 占位 | 待 CDP / Playwright 实现 |
+| 5. upload | [x] 骨架完成 | Playwright + CDP；**待填选择器（TODO_SELECTOR_*）** |
 
 ## License
 

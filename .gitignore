@@ -9,6 +9,11 @@ debug-*.ps1
 run-*.ps1
 prep-*.ps1
 
+# Node
+upload/node_modules/
+upload/package-lock.json
+upload/uploaded-state.json
+
 # OS
 .DS_Store
 Thumbs.db
