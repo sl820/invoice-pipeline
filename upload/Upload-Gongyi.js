@@ -30,7 +30,7 @@ const RETRY_BACKOFF_MS = [2000, 5000];
 const TARGET_STATE = "待开具";
 
 function parseArgs() {
-  const args = { sourceDir: null, dryRun: false, limit: Infinity, yes: false };
+  const args = { sourceDir: null, dryRun: false, limit: Infinity, yes: false, delayMs: 0 };
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -38,8 +38,9 @@ function parseArgs() {
     else if (a === "--dry-run") args.dryRun = true;
     else if (a === "--limit") args.limit = parseInt(argv[++i], 10);
     else if (a === "--yes") args.yes = true;
+    else if (a === "--delay") args.delayMs = parseInt(argv[++i], 10);
     else if (a === "--help" || a === "-h") {
-      console.log("Usage: node Upload-Gongyi.js --source-dir <path> [--dry-run] [--limit N] [--yes]");
+      console.log("Usage: node Upload-Gongyi.js --source-dir <path> [--dry-run] [--limit N] [--yes] [--delay 3000]");
       process.exit(0);
     }
   }
@@ -167,7 +168,6 @@ async function processOne(page, pdfPath, opts, payerHint, amountHint) {
   // 5. 点立即开票
   await allRows.nth(target.rowIdx).locator("button:has(span:text-is('立即开票'))").click();
   await page.waitForTimeout(2000);
-  return { submitted: true, uploadedName, target };
 
   const modal = page.locator(".ant-modal");
   if (await modal.count() === 0) throw new Error("modal-not-shown");
@@ -238,6 +238,7 @@ async function main() {
   let ok = 0, fail = 0, skipped = 0;
   const limit = Math.min(args.limit, todo.length);
   for (let i = 0; i < limit; i++) {
+    if (args.delayMs > 0) { console.log(`  [delay] ${args.delayMs}ms ...`); await new Promise(r => setTimeout(r, args.delayMs)); }
     const pdf = todo[i];
     const basename = path.basename(pdf);
     const fromMapping = lookupInMapping(mapping, pdf);
