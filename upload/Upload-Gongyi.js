@@ -167,6 +167,7 @@ async function processOne(page, pdfPath, opts, payerHint, amountHint) {
   // 5. 点立即开票
   await allRows.nth(target.rowIdx).locator("button:has(span:text-is('立即开票'))").click();
   await page.waitForTimeout(2000);
+  return { submitted: true, uploadedName, target };
 
   const modal = page.locator(".ant-modal");
   if (await modal.count() === 0) throw new Error("modal-not-shown");
@@ -186,9 +187,18 @@ async function processOne(page, pdfPath, opts, payerHint, amountHint) {
     if (await cancelBtn.count() > 0) { await cancelBtn.click(); await page.waitForTimeout(1000); }
     return { dryRun: true, uploadedName, target };
   }
+  // Click 主弹框 确 定
   await modal.locator(".ant-btn-primary:has-text('确 定')").click();
-  await page.waitForSelector(".ant-modal", { state: "detached", timeout: 15000 });
+  // 平台会再弹一个二级确认弹框: "确定要提交票据？"
   await page.waitForTimeout(1500);
+  // 抓最外层 ant-modal-wrap 或多个 .ant-modal 都点一下 确 定
+  for (const m of await page.locator(".ant-modal").all()) {
+    const btn = m.locator(".ant-btn-primary:has-text('确 定')");
+    if (await btn.count() > 0) { try { await btn.first().click({ timeout: 5000 }); } catch {} }
+  }
+  try { await page.waitForSelector(".ant-modal", { state: "detached", timeout: 30000 }); }
+  catch (e) { console.log("  [warn] modal detach wait timed out (may still have succeeded)"); }
+  await page.waitForTimeout(2000);
   return { submitted: true, uploadedName, target };
 }
 
@@ -221,7 +231,8 @@ async function main() {
   const ctx = browser.contexts()[0];
   const page = ctx.pages()[0];
   console.log(`[nav] -> ${PLATFORM_URL}`);
-  await page.goto(PLATFORM_URL, { waitUntil: "networkidle", timeout: 30000 });
+  await page.goto(PLATFORM_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await page.waitForSelector("#control-hooks_invoiceTitle", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(1500);
 
   let ok = 0, fail = 0, skipped = 0;
