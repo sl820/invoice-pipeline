@@ -1,4 +1,4 @@
-# invoice-pipeline
+﻿# invoice-pipeline
 
 > 阿里公益平台发票自动化流水线 · Codex Skill
 
@@ -117,6 +117,45 @@ invoice-pipeline/
 | 3. rename | [x] 已实现 | 已用 6 张样本端到端验证（SHA256 一致） |
 | 4. archive | [x] 已实现 | 默认跳过 |
 | 5. upload | [x] 已实现 | Playwright + CDP；dry-run 用 2 张样本验证 ok=2（含 amount 消歧路径） |
+
+
+## OCR 精度优化
+
+`Step 2 (ocr)` 的核心：pdftoppm 转 PNG → `bl vision describe` 用 `qwen3-vl-plus` 转写 → Node 正则解析 payer/amount/invoiceDate。
+
+为提升 OCR 精度做了以下加固：
+
+### 1. 易混字表（`prompts/extract-payer.md`）
+
+基于真实样本中发现的 OCR 错误，扩充了 prompt 的形近/音近字表：
+- 市/县/区；锋/峰/蜂；泱/秧；枷/柳
+- 仁/鼎/易；及/脉；消/蒲；带/暹
+- 杯/梵/杰；至/臻；号/唛；售/倍
+- 焰/耀/曜；侈/鑫；坑/涧；陶/瓷
+
+### 2. 解析后处理（`upload/Ocr-Parse.js`）
+
+输出字段除 `payer / amount / invoiceDate` 外，增加：
+- `payerHasSuffix: bool` — 解析出的公司名是否包含 `有限公司/有限责任公司/经营部/商行/个体工商户` 等合法后缀。**没有后缀通常意味着 PDF 上的公司名被截断**（如 `文化传播有限公司` 而原名是 `阿鲤鱼（杭州）文化传播有限公司`）。
+- `payerNormalized: string` — 归一化后的 payer（半角括号/书名号 → 全角圆括号；去除冗余省级前缀）。
+
+### 3. 增量 OCR（`scripts/Ocr-Bailian.ps1`）
+
+之前每次跑都会重新扫描所有 PDF。现在改为：
+- 优先复用最新的 `mapping-*.json`
+- **跳过 error 为空、payer 和 amount 都有值的记录**
+- 只对异常的 record 重新调 `bl`（把它们拷贝到 `.ocr-cache` 让主循环处理）
+
+配合 `payerHasSuffix` 字段，可以检测到公司名被截断的样本并自动重新 OCR。
+
+### 4. 中文路径兼容性
+
+PowerShell 调用外部程序对中文路径支持不好。改为：先把 PDF 拷贝到 `.ocr-cache` 下的 ASCII 临时名，调 `pdftoppm`，生成 PNG 后再 mv 回带中文名的目标位置。
+
+### 5. bl 错误友好化
+
+之前 `bl vision describe` 失败时，错误信息是 PowerShell 的 `node.exe : { ... }`，可读性差。现在提取 message 字段（如 `Access denied, please make sure your account is in good standing`），写入 `mapping` 的 `error` 字段。
+
 
 ## License
 
