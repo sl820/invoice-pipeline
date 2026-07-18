@@ -30,7 +30,7 @@ const RETRY_BACKOFF_MS = [2000, 5000];
 const TARGET_STATE = "待开具";
 
 function parseArgs() {
-  const args = { sourceDir: null, dryRun: false, limit: Infinity, yes: false, delayMs: 0 };
+  const args = { sourceDir: null, dryRun: false, limit: Infinity, yes: false, delayMs: 0, disambigIndex: 0 };
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -39,6 +39,7 @@ function parseArgs() {
     else if (a === "--limit") args.limit = parseInt(argv[++i], 10);
     else if (a === "--yes") args.yes = true;
     else if (a === "--delay") args.delayMs = parseInt(argv[++i], 10);
+    else if (a === "--disambig-index" || a === "--di") args.disambigIndex = parseInt(argv[++i], 10);
     else if (a === "--help" || a === "-h") {
       console.log("Usage: node Upload-Gongyi.js --source-dir <path> [--dry-run] [--limit N] [--yes] [--delay 3000]");
       process.exit(0);
@@ -69,10 +70,16 @@ function logFailure(basename, reason, detail) {
 
 // 读 mapping-*.json 最新一份，构建 basename -> {payer, amount} 索引
 function loadMapping(sourceDir) {
-  const files = fs.readdirSync(sourceDir).filter(n => /^mapping-.*\.json$/.test(n));
-  if (files.length === 0) return null;
-  const latest = files.sort().pop();
-  const raw = fs.readFileSync(path.join(sourceDir, latest), "utf8");
+  let candidates = fs.readdirSync(sourceDir).filter(n => /^mapping-.*\.json$/.test(n));
+  if (candidates.length === 0) {
+    const sub = path.join(sourceDir, 'mapping-runs');
+    if (fs.existsSync(sub)) {
+      candidates = fs.readdirSync(sub).filter(n => /^mapping-.*\.json$/.test(n)).map(n => path.join('mapping-runs', n));
+    }
+  }
+  if (candidates.length === 0) return null;
+  const latest = candidates.sort().pop();
+  const raw = fs.readFileSync(path.join(sourceDir, latest), 'utf8');
   try { return JSON.parse(raw); } catch { return null; }
 }
 
@@ -99,11 +106,15 @@ function lookupInMapping(records, pdfPath) {
     if (rBase === base.split("_")[0]) {
       return { payer: r.payer || "", amount: r.amount || "" };
     }
+    // 兜底: PDF 已重命名为 {payer}.pdf，按 payer 反查
+    if (r.payer && (base === r.payer || base === r.payer + "(2)" || base === r.payer + "(3)")) {
+      return { payer: r.payer || "", amount: r.amount || "" };
+    }
   }
   return null;
 }
 
-async function processOne(page, pdfPath, opts, payerHint, amountHint) {
+async function processOne(page, pdfPath, opts, payerHint, amountHint, usedKeys) {
   const basename = path.basename(pdfPath);
   // 1. 推断 payer
   const payer = payerHint || inferPayer(basename);
@@ -132,7 +143,9 @@ async function processOne(page, pdfPath, opts, payerHint, amountHint) {
       };
     })
   );
-  const pending = rowData.filter(r => r.state === TARGET_STATE);
+  const allPending = rowData.filter(r => r.state === TARGET_STATE);
+  const usedHere = allPending.filter(r => usedKeys && usedKeys.has(r.applicationId));
+  const pending = allPending.filter(r => !usedKeys || !usedKeys.has(r.applicationId));
 
   if (pending.length === 0) {
     const stateList = rowData.map(r => `${r.state}(${r.amount}元 ${r.shop})`).join("; ");
@@ -149,18 +162,27 @@ async function processOne(page, pdfPath, opts, payerHint, amountHint) {
     const want = norm(amountHint);
     const matched = pending.filter(r => norm(r.amount) === want);
     if (matched.length === 1) {
-      console.log(`  [ambig] ${pending.length} 条待开具，amount="${amountHint}" 唯一匹配 1 条`);
+      console.log(`  [ambig] ${allPending.length} 条待开具（已用 ${usedHere.length} → ${pending.length} 候选），amount="${amountHint}" 唯一匹配 1 条`);
       target = matched[0];
     } else if (matched.length === 0) {
       const lines = pending.map(r => `  [${r.seq}] 金额=${r.amount} 店铺=${r.shop} 月份=${r.months}`).join("\n");
-      throw new Error(`amount-no-match: ${pending.length} 条待开具但无一条 amount="${amountHint}" 对得上。\n候选:\n${lines}`);
+      throw new Error(`amount-no-match: ${pending.length} 条待开具但无一条 amount="${amountHint}" 对得上。\
+候选:\n${lines}\n建议: 检查 OCR 金额是否正确，或 1 个 payer 多 row 时按月/店铺人工拆分`);
     } else {
       const lines = matched.map(r => `  [${r.seq}] 金额=${r.amount} 店铺=${r.shop}`).join("\n");
-      throw new Error(`amount-multiple: amount="${amountHint}" 匹配 ${matched.length} 条，仍需人工。\n候选:\n${lines}`);
+      const sortedBySeq = [...matched].sort((a, b) => parseInt(a.seq || 0, 10) - parseInt(b.seq || 0, 10));
+      const idx = Math.min((opts.disambigIndex || 0), sortedBySeq.length - 1);
+      const pick = sortedBySeq[idx];
+      console.log(`  [ambig] amount="${amountHint}" 匹配 ${matched.length} 条，按 seq 升序取第 ${idx + 1}/${sortedBySeq.length} (seq=${pick.seq} ${pick.shop} ${pick.months})`);
+      target = pick;
     }
   } else {
     const lines = pending.map(r => `  [${r.seq}] 金额=${r.amount} 店铺=${r.shop} 月份=${r.months}`).join("\n");
-    throw new Error(`match-multiple: "${payer}"有 ${pending.length} 条待开具，且无 amount 信息可消歧。\n候选:\n${lines}\n建议: 跑 Step 2 (Ocr-Bailian) 抽取 amount 后重试。`);
+    const sortedBySeq = [...pending].sort((a, b) => parseInt(a.seq || 0, 10) - parseInt(b.seq || 0, 10));
+    const idx = Math.min((opts.disambigIndex || 0), sortedBySeq.length - 1);
+    const pick = sortedBySeq[idx];
+    console.log(`  [ambig] "${payer}" 有 ${pending.length} 条待开具，无 amount；按 seq 升序取第 ${idx + 1}/${sortedBySeq.length} (seq=${pick.seq} ${pick.shop} ${pick.months} amount=${pick.amount})`);
+    target = pick;
   }
 
   console.log(`  [match] seq=${target.seq} 申请ID=${target.applicationId} 金额=${target.amount} 店铺=${target.shop}`);
@@ -229,13 +251,32 @@ async function main() {
   catch (e) { console.error(`ERROR: CDP 无法连接: ${e.message}`); console.error("请先运行 scripts/Start-Chrome-CDP.ps1"); process.exit(1); }
 
   const ctx = browser.contexts()[0];
-  const page = ctx.pages()[0];
+
+  // 每次上传后用 fresh page 避免 page 引用失效
+  async function freshPage() {
+    let page = ctx.pages().find(p => {
+      if (p.isClosed()) return false;
+      const u = (() => { try { return p.url(); } catch { return ""; } })();
+      return u.includes("alibabafoundation") || u.includes("open.workbench");
+    });
+    if (!page) {
+      page = await ctx.newPage();
+    }
+    try { await page.goto(PLATFORM_URL, { waitUntil: "domcontentloaded", timeout: 30000 }); } catch (e) {
+      console.log("  [warn] goto failed, open newPage");
+      try { page = await ctx.newPage(); await page.goto(PLATFORM_URL, { waitUntil: "domcontentloaded", timeout: 30000 }); } catch (e2) {}
+    }
+    await page.waitForSelector("#control-hooks_invoiceTitle", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    return page;
+  }
+
+  let page = await freshPage();
   console.log(`[nav] -> ${PLATFORM_URL}`);
-  await page.goto(PLATFORM_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForSelector("#control-hooks_invoiceTitle", { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(1500);
 
   let ok = 0, fail = 0, skipped = 0;
+  // 跨 PDF 跟踪已被本次 run 用掉的 row.applicationId（同公司多张发票用）
+  const usedKeys = new Set();
   const limit = Math.min(args.limit, todo.length);
   for (let i = 0; i < limit; i++) {
     if (args.delayMs > 0) { console.log(`  [delay] ${args.delayMs}ms ...`); await new Promise(r => setTimeout(r, args.delayMs)); }
@@ -248,15 +289,18 @@ async function main() {
 
     for (let attempt = 1; attempt <= RETRY_MAX; attempt++) {
       try {
-        const result = await processOne(page, pdf, args, payerHint, amountHint);
+        const result = await processOne(page, pdf, args, payerHint, amountHint, usedKeys);
         if (result.submitted) {
           state[basename] = { hash: fileHash(pdf), uploadedAt: new Date().toISOString(), uploadedName: result.uploadedName, target: result.target, size: fs.statSync(pdf).size };
+          if (result.target && result.target.applicationId) usedKeys.add(result.target.applicationId);
           saveState(state);
           console.log(`  [ok] submitted`);
           ok++;
+          try { page = await freshPage(); } catch (e) {}
         } else if (result.dryRun) {
           console.log(`  [ok] dry-run passed`);
           ok++;
+          try { page = await freshPage(); } catch (e) {}
         }
         break;
       } catch (err) {
@@ -271,11 +315,13 @@ async function main() {
             console.error(`  [fail] ${firstLine}`);
             logFailure(basename, "error", err.message);
             fail++;
+            try { page = await freshPage(); } catch (e) {}
           }
         } else {
           const backoff = RETRY_BACKOFF_MS[attempt - 1];
           console.error(`  [retry ${attempt}/${RETRY_MAX}] ${err.message.split("\n")[0]} (wait ${backoff}ms)`);
           await new Promise(r => setTimeout(r, backoff));
+          try { page = await freshPage(); } catch (e) {}
         }
       }
     }

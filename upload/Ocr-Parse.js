@@ -32,7 +32,7 @@ const text = fs.readFileSync(file, "utf8");
 function normalizeBrackets(s) {
   if (!s) return s;
   return s
-    .replace(/[()]/g, "（")          // 半角圆括号 → 全角
+    .replace(/\(/g, "（").replace(/\)/g, "）")  // 半角圆括号 → 全角
     .replace(/[<>]/g, "（")          // 角括号 → 全角
     .replace(/【】/g, "（）")         // 方括号 → 全角圆括号
     .replace(/《/g, "（")            // 书名号左 → 全角圆括号

@@ -32,6 +32,7 @@ const MODEL = arg("--model", "qwen3-vl-plus");
 const DPI = parseInt(arg("--dpi", "200"), 10);
 const LIMIT = parseInt(arg("--limit", "0"), 10);
 const PROBE = process.argv.includes("--probe");
+const ALLOW_BARE = process.argv.includes("--allow-bare-invoice");
 
 const CACHE_DIR = path.join(SOURCE_DIR, ".ocr-cache");
 const OUT_DIR = path.join(SOURCE_DIR, "mapping-runs");
@@ -45,10 +46,31 @@ function listPdfs(dir) {
     .filter(function (n) {
       const b = path.basename(n, ".pdf");
       const i = b.indexOf("_");
-      if (i <= 0) return false;
-      return /^\d{10,}$/.test(b.substring(0, i));
+      if (i > 0) {
+        return /^\d{10,}$/.test(b.substring(0, i));
+      }
+      return ALLOW_BARE && /^\d{10,}$/.test(b);
     })
     .map(function (n) { return path.join(dir, n); });
+}
+
+// 智能选择 ground truth payer
+// 优先级: 看着像公司/小店/自然人都接受 → 用 OCR；否则用文件名
+function selectPayer(ocrPayer, filenameCompany) {
+  const co = (ocrPayer || "").trim();
+  // 必须有内容，长度 2-40
+  if (co.length < 2 || co.length > 40) return { payer: filenameCompany, source: "filename" };
+  // 不能是噪音标签
+  const NOISE = new Set(["交款人", "名称", "购买方", "抬头", "购买方信息", "交款人信息", "收据", "凭证", "统一社会信用代码", "纳税人识别号"]);
+  if (NOISE.has(co) || /^(交款人|名称|购买方|抬头|[:：\s])+$/.test(co)) return { payer: filenameCompany, source: "filename" };
+  // 自然人姓名：2-4 个汉字（不含标点、数字）
+  const isNaturalPerson = /^[\u4e00-\u9fa5]{2,4}$/.test(co);
+  // 公司/小店/个体户
+  const hasCoSuffix = /(有限公司|有限责任公司|股份有限公司|经营部|商行|商店|门市部|超市|便利店|百货|商行|店|号|厂|工作室|个体工商户|集团|事务所|中心|合作社|经营处|经销处|经营店|销售部|商场|商城|市场|批发部|供应站|服务部)/.test(co);
+  // 不含明显无关内容（如带斜杠、空格式等）
+  const looksValid = !/[\u0000-\u001f]/.test(co);
+  if ((isNaturalPerson || hasCoSuffix) && looksValid) return { payer: co, source: "ocr" };
+  return { payer: filenameCompany, source: "filename" };
 }
 
 async function blDescribe(img) {
@@ -72,13 +94,14 @@ function nodeParse(o) {
 
 async function processOne(pdf) {
   const base = path.basename(pdf, ".pdf");
-  const company = base.substring(base.indexOf("_") + 1);
+  const uscore = base.indexOf("_");
+  const company = uscore > 0 ? base.substring(uscore + 1) : "";
   const pngBase = path.join(CACHE_DIR, base + "-p1");
   const pngFile = pngBase + ".png";
   const ocrTxt = path.join(CACHE_DIR, base + "-ocr.txt");
   const t0 = Date.now();
   let err = "";
-  let payer = company, ocrPayer = "", amount = "", invoiceDate = "";
+  let payer = "", ocrPayer = "", amount = "", invoiceDate = "", method = "bl-vision-describe";
   try {
     if (!fs.existsSync(pngFile)) pdftoppm(pdf, pngBase);
     if (!fs.existsSync(pngFile)) throw new Error("png not generated");
@@ -91,10 +114,13 @@ async function processOne(pdf) {
     amount = parsed.amount || "";
     invoiceDate = parsed.invoiceDate || "";
     if (!amount) throw new Error("amount-empty");
+    const sel = selectPayer(ocrPayer, company);
+    payer = sel.payer;
+    method = "payer=" + sel.source + "+bl-vision-describe";
   } catch (e) { err = e.message; }
   return {
     pdf: pdf, payer: payer, ocrPayer: ocrPayer, amount: amount, invoiceDate: invoiceDate,
-    method: "filename-payer+bl-vision-describe", model: MODEL, dpi: DPI,
+    method: method, model: MODEL, dpi: DPI,
     elapsedMs: Date.now() - t0, error: err
   };
 }
