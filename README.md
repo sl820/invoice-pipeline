@@ -68,8 +68,20 @@ scan  ->  ocr  ->  rename  ->  archive  ->  upload
 - **只处理 待开具 状态**（已开具自动跳过）
 - **0 条匹配** → skip：PDF 对应的发票可能平台还没申请
 - **1 条匹配** → 自动上传
-- **2+ 条匹配** + mapping 含 amount → 按金额筛；筛后 1 条 → 上传；筛后 0/N 条 → skip
-- **2+ 条匹配** + mapping 无 amount → skip：同公司多张待开票，需要人工确认
+- **2+ 条匹配** + mapping 含 amount → 按金额筛：
+  - **筛后 1 条** → 上传
+  - **筛后 0 条** → skip：检查 OCR 金额是否正确，或 1 个 payer 多 row 时按月/店铺人工拆分
+  - **筛后 2+ 条** → 按 row.seq 升序自动取第 1 条（同公司同金额多张发票，逐张按发票号顺序分配）
+- **2+ 条匹配** + mapping 无 amount → 同上：按 row.seq 升序自动取第 1 条
+
+### 跨 PDF 去重（同公司多张发票）
+
+维护 `usedKeys: Set<applicationId>` 跨 PDF 跟踪本次 run 已用 row：
+- 第一张发票处理完，把 row 的 applicationId 加入 usedKeys
+- 第二张同公司发票处理时，pending 列表里已被第一张用的 row 自动过滤掉
+- 解决「同公司多张发票检索出多个开具链接时，只会在第一条链接提交」的问题
+
+`--disambig-index N` 可手动指定 seq 升序时的偏移量。
 
 ## 工程规范
 
@@ -124,6 +136,16 @@ invoice-pipeline/
 `Step 2 (ocr)` 的核心：pdftoppm 转 PNG → `bl vision describe` 用 `qwen3-vl-plus` 转写 → Node 正则解析 payer/amount/invoiceDate。
 
 为提升 OCR 精度做了以下加固：
+
+### 0. 括号归一化 bug 修复（`upload/Ocr-Parse.js`）
+
+`normalizeBrackets` 之前 `.replace(/[()]/g, "（")` 把半角右括号 `)` 也替换成全角左括号 `（`，右括号被吞。典型症状：OCR 原文 `美丽多金(深圳)珠宝有限公司` 变成 `美丽多金（深圳（珠宝有限公司`（中间两个孤立左括号，公司名错位）。
+
+修复后分别处理：
+
+```js
+.replace(/\(/g, "（").replace(/\)/g, "）")  // 半角 → 全角，圆括号分别处理
+```
 
 ### 1. 易混字表（`prompts/extract-payer.md`）
 
