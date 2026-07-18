@@ -18,6 +18,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const { chromium } = require("playwright");
 
 const PLATFORM_URL = "https://open.alibabafoundation.com/open/workbench/employee/org/donation/invoice/manage";
@@ -114,6 +115,16 @@ function lookupInMapping(records, pdfPath) {
   return null;
 }
 
+function copyForUpload(pdfPath, payer, uniq) {
+  const tmpDir = path.join(os.tmpdir(), "invoice-pipeline-upload");
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const safe = payer.replace(/[<>:|\"?*]/g, "_").trim();
+  const safeUniq = String(uniq || Date.now()).replace(/[^a-zA-Z0-9]/g, "_");
+  const tmpPath = path.join(tmpDir, safe + "_" + safeUniq + ".pdf");
+  fs.copyFileSync(pdfPath, tmpPath);
+  return tmpPath;
+}
+
 async function processOne(page, pdfPath, opts, payerHint, amountHint, usedKeys) {
   const basename = path.basename(pdfPath);
   // 1. 推断 payer
@@ -195,34 +206,39 @@ async function processOne(page, pdfPath, opts, payerHint, amountHint, usedKeys) 
   if (await modal.count() === 0) throw new Error("modal-not-shown");
   const modalInfo = await modal.first().evaluate(m => m.innerText.replace(/\s+/g, " ").slice(0, 200));
 
-  // 6. 上传
-  await modal.locator("input[type=file]").setInputFiles(pdfPath);
-  await page.waitForTimeout(2000);
-  const uploadedItem = modal.locator(".ant-upload-list-item");
-  if (await uploadedItem.count() === 0) throw new Error("upload-failed: .ant-upload-list-item 未出现");
-  const uploadedName = (await uploadedItem.first().innerText()).trim();
+  // 6. 复制 PDF 到临时目录，用纯 payer 名（避免 (2)/(3) 后缀被平台检索忽略）
+  const uploadTmp = copyForUpload(pdfPath, payer, target.applicationId || (Date.now() + "_" + basename));
+  try {
+    await modal.locator("input[type=file]").setInputFiles(uploadTmp);
+    await page.waitForTimeout(2000);
+    const uploadedItem = modal.locator(".ant-upload-list-item");
+    if (await uploadedItem.count() === 0) throw new Error("upload-failed: .ant-upload-list-item 未出现");
+    const uploadedName = (await uploadedItem.first().innerText()).trim();
 
-  // 7. 决定提交
-  if (!opts.yes) {
-    console.log(`  [dry-run] 弹框已就绪，PDF=${basename}`);
-    const cancelBtn = modal.locator(".ant-btn:has-text('取 消')");
-    if (await cancelBtn.count() > 0) { await cancelBtn.click(); await page.waitForTimeout(1000); }
-    return { dryRun: true, uploadedName, target };
+    // 7. 决定提交
+    if (!opts.yes) {
+      console.log(`  [dry-run] 弹框已就绪，PDF=${basename}，上传名=${path.basename(uploadTmp)}`);
+      const cancelBtn = modal.locator(".ant-btn:has-text('取 消')");
+      if (await cancelBtn.count() > 0) { await cancelBtn.click(); await page.waitForTimeout(1000); }
+      return { dryRun: true, uploadedName, target };
+    }
+    // Click 主弹框 确 定
+    await modal.locator(".ant-btn-primary:has-text('确 定')").click();
+    // 平台会再弹一个二级确认弹框: "确定要提交票据？"
+    await page.waitForTimeout(1500);
+    // 抓最外层 ant-modal-wrap 或多个 .ant-modal 都点一下 确 定
+    for (const m of await page.locator(".ant-modal").all()) {
+      const btn = m.locator(".ant-btn-primary:has-text('确 定')");
+      if (await btn.count() > 0) { try { await btn.first().click({ timeout: 5000 }); } catch {} }
+    }
+    try { await page.waitForSelector(".ant-modal", { state: "detached", timeout: 30000 }); }
+    catch (e) { console.log("  [warn] modal detach wait timed out (may still have succeeded)"); }
+    await page.waitForTimeout(2000);
+    return { submitted: true, uploadedName, target };
+  } finally {
+    try { fs.unlinkSync(uploadTmp); } catch {}
   }
-  // Click 主弹框 确 定
-  await modal.locator(".ant-btn-primary:has-text('确 定')").click();
-  // 平台会再弹一个二级确认弹框: "确定要提交票据？"
-  await page.waitForTimeout(1500);
-  // 抓最外层 ant-modal-wrap 或多个 .ant-modal 都点一下 确 定
-  for (const m of await page.locator(".ant-modal").all()) {
-    const btn = m.locator(".ant-btn-primary:has-text('确 定')");
-    if (await btn.count() > 0) { try { await btn.first().click({ timeout: 5000 }); } catch {} }
   }
-  try { await page.waitForSelector(".ant-modal", { state: "detached", timeout: 30000 }); }
-  catch (e) { console.log("  [warn] modal detach wait timed out (may still have succeeded)"); }
-  await page.waitForTimeout(2000);
-  return { submitted: true, uploadedName, target };
-}
 
 async function main() {
   const args = parseArgs();
