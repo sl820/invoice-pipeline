@@ -32,9 +32,12 @@ for (const rec of data) {
     continue;
   }
   const dir = path.dirname(rec.pdf);
-  const baseName = path.basename(rec.pdf, ".pdf");
-  // 如果当前不是纯票号格式，跳过（已被 rename 过了）
-  if (!/^\d{10,}$/.test(baseName)) { skipped++; continue; }
+  let baseName = path.basename(rec.pdf, ".pdf");
+  // 处理中间态：{票号}_{公司}.pdf → 提取票号，按 payer 重命名
+  // 处理纯票号：{票号}.pdf → 按 payer 重命名
+  // 如果已是 {公司}.pdf 格式（无前缀），跳过
+  const invMatch = /^(\d{10,})(?:_(.+))?$/.exec(baseName);
+  if (!invMatch) { skipped++; continue; }
 
   let target = path.join(dir, sanitize(rec.payer) + ".pdf");
   if (target === rec.pdf) { skipped++; continue; }
